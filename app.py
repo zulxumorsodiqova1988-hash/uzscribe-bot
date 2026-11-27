@@ -45,17 +45,26 @@ def transcript_kb(tid, bot_u, uid, include_share):
         rows.append([{"text": "Share with a Friend (+10 Free Credits)", "url": f"https://t.me/share/url?url={quote(link)}&text={quote(txt)}"}])
     return {"inline_keyboard": rows}
 
-def groq_llm(gk, sp, ut):
-    r = SESSION.post("https://api.groq.com/openai/v1/chat/completions", headers={"Authorization": f"Bearer {gk}", "Content-Type": "application/json"}, json={"model": "openai/gpt-oss-20b", "temperature": 0.2, "max_tokens": 1024, "messages": [{"role": "system", "content": sp}, {"role": "user", "content": ut[:6000]}]}, timeout=25)
-    return r.json()["choices"][0]["message"]["content"].strip() if r.ok else ""
+def groq_llm(gk: str, sp: str, txt: str) -> str:
+    r = SESSION.post("https://api.groq.com/openai/v1/chat/completions", headers={"Authorization": f"Bearer {gk}", "Content-Type": "application/json"}, json={"model": "openai/gpt-oss-20b", "reasoning_effort": "low", "temperature": 0.2, "max_completion_tokens": 1024, "messages": [{"role": "system", "content": sp}, {"role": "user", "content": txt[:6000]}]}, timeout=25)
+    if r.ok:
+        return (r.json()["choices"][0]["message"].get("content") or "").strip()
+    print(f"[render] groq_llm {r.status_code}: {r.text[:200]}", flush=True)
+    return ""
 
-def groq_transcribe(gk, audio_bytes, fname, lang="uz"):
-    h = {"Authorization": f"Bearer {gk}"}
+def groq_transcribe(gk: str, ab: bytes, fname: str, lang: str = "uz") -> str:
+    ext = Path(fname).suffix.lower()
+    stem = Path(fname).stem or "voice"
+    mmap = {".oga": (".ogg", "audio/ogg"), ".ogg": (".ogg", "audio/ogg"), ".opus": (".ogg", "audio/ogg"), ".mp3": (".mp3", "audio/mpeg"), ".m4a": (".m4a", "audio/mp4"), ".mp4": (".mp4", "video/mp4"), ".wav": (".wav", "audio/wav"), ".flac": (".flac", "audio/flac"), ".webm": (".webm", "audio/webm")}
+    next_ext, mime = mmap.get(ext, (".ogg", "audio/ogg"))
+    safe_name = f"{stem}{next_ext}"
     d = {"model": "whisper-large-v3", "response_format": "json"}
     if lang in ("uz", "ru", "en"): d["language"] = lang
     if lang == "uz": d["prompt"] = "O'zbek tilidagi toza lotin yozuvi: o', g', sh, ch. Assalomu alaykum."
-    r = SESSION.post("https://api.groq.com/openai/v1/audio/transcriptions", headers=h, data=d, files={"file": (fname, audio_bytes, "audio/ogg")}, timeout=60)
-    r.raise_for_status()
+    r = SESSION.post("https://api.groq.com/openai/v1/audio/transcriptions", headers={"Authorization": f"Bearer {gk}"}, data=d, files={"file": (safe_name, ab, mime)}, timeout=60)
+    if not r.ok:
+        print(f"[render] groq_transcribe {r.status_code} ({safe_name}): {r.text[:200]}", flush=True)
+        r.raise_for_status()
     raw = (r.json().get("text") or "").strip()
     if lang == "uz" and len(raw) >= 4:
         try:
