@@ -1,0 +1,11 @@
+name: Keep Render Alive 24/7
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping UzScribeBot Health
+        run: curl -fsS https://uzscribe-bot.onrender.com/health
