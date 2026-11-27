@@ -9,8 +9,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 DB_PATH = Path(__file__).resolve().parent / "scribe_users.db"
 FREE_DAILY_LIMIT, REFERRAL_BONUS = 5, 10
 PACKS = {
-    "pack_100": {"title": "100 Audio Credits", "description": "100 fast voice transcriptions (UZ/RU/EN), never expire.", "stars": 50, "credits": 100, "pro_days": 0},
-    "pro_30d": {"title": "Pro Unlimited (30 Days)", "description": "Unlimited voice-to-text (UZ/RU/EN) for 30 days.", "stars": 150, "credits": 0, "pro_days": 30},
+    "pack_100": {"title": "100 Audio Credits", "description": "100 fast voice transcriptions, summaries & translations (never expire).", "stars": 50, "credits": 100, "pro_days": 0},
+    "pro_30d": {"title": "Pro Unlimited (30 Days)", "description": "Unlimited voice-to-text, AI summaries & translations for 30 days.", "stars": 150, "credits": 0, "pro_days": 30},
 }
 SESSION = requests.Session()
 
@@ -19,6 +19,7 @@ def api(t, m): return f"https://api.telegram.org/bot{t}/{m}"
 def init_db():
     c = sqlite3.connect(str(DB_PATH), check_same_thread=False)
     c.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, free_date TEXT, free_used INTEGER DEFAULT 0, paid_credits INTEGER DEFAULT 0, pro_until TEXT, referred_by INTEGER, referrals INTEGER DEFAULT 0, total_uses INTEGER DEFAULT 0, stars_spent INTEGER DEFAULT 0, lang TEXT DEFAULT 'uz', created_at TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS transcripts (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, text TEXT, created_at TEXT)")
     c.commit()
     return c
 
@@ -36,10 +37,17 @@ def buy_kb():
 def lang_kb():
     return {"inline_keyboard": [[{"text": "O'zbek (UZ)", "callback_data": "lang:uz"}, {"text": "Russian (RU)", "callback_data": "lang:ru"}], [{"text": "English (EN)", "callback_data": "lang:en"}, {"text": "Auto", "callback_data": "lang:auto"}]]}
 
-def share_kb(bot_u, uid):
-    link = f"https://t.me/{bot_u}?start=ref_{uid}"
-    txt = "Ovozli xabarlarni 1 soniyada aniq matnga aylantiruvchi bot (UZ/RU/EN)!"
-    return {"inline_keyboard": [[{"text": "Share with a Friend (+10 Free Credits)", "url": f"https://t.me/share/url?url={quote(link)}&text={quote(txt)}"}]]}
+def transcript_kb(tid, bot_u, uid, include_share):
+    rows = [[{"text": "Summarize", "callback_data": f"act:sum:{tid}"}, {"text": "-> EN", "callback_data": f"act:en:{tid}"}, {"text": "-> RU", "callback_data": f"act:ru:{tid}"}, {"text": "-> UZ", "callback_data": f"act:uz:{tid}"}]]
+    if include_share:
+        link = f"https://t.me/{bot_u}?start=ref_{uid}"
+        txt = "Ovozli xabarlarni 1 soniyada matnga aylantiruvchi + tarjima qiluvchi AI bot!"
+        rows.append([{"text": "Share with a Friend (+10 Free Credits)", "url": f"https://t.me/share/url?url={quote(link)}&text={quote(txt)}"}])
+    return {"inline_keyboard": rows}
+
+def groq_llm(gk, sp, ut):
+    r = SESSION.post("https://api.groq.com/openai/v1/chat/completions", headers={"Authorization": f"Bearer {gk}", "Content-Type": "application/json"}, json={"model": "openai/gpt-oss-20b", "temperature": 0.2, "max_tokens": 1024, "messages": [{"role": "system", "content": sp}, {"role": "user", "content": ut[:6000]}]}, timeout=25)
+    return r.json()["choices"][0]["message"]["content"].strip() if r.ok else ""
 
 def groq_transcribe(gk, audio_bytes, fname, lang="uz"):
     h = {"Authorization": f"Bearer {gk}"}
@@ -51,10 +59,8 @@ def groq_transcribe(gk, audio_bytes, fname, lang="uz"):
     raw = (r.json().get("text") or "").strip()
     if lang == "uz" and len(raw) >= 4:
         try:
-            lr = SESSION.post("https://api.groq.com/openai/v1/chat/completions", headers={**h, "Content-Type": "application/json"}, json={"model": "openai/gpt-oss-20b", "temperature": 0.1, "max_tokens": 1024, "messages": [{"role": "system", "content": "Fix ONLY Uzbek Latin speech-to-text spelling and punctuation (o', g', sh, ch). Output ONLY the cleaned Uzbek text."}, {"role": "user", "content": raw}]}, timeout=20)
-            if lr.ok:
-                c = lr.json()["choices"][0]["message"]["content"].strip()
-                if c: return c
+            c = groq_llm(gk, "Fix ONLY Uzbek Latin speech-to-text spelling and punctuation (o', g', sh, ch). Output ONLY the cleaned Uzbek text.", raw)
+            if c: return c
         except Exception: pass
     return raw
 
@@ -67,7 +73,7 @@ def bot_loop():
         return
     conn = init_db()
     bu = SESSION.get(api(t, "getMe"), timeout=15).json()["result"]["username"]
-    print(f"[render] @{bu} 24/7 cloud bot live!", flush=True)
+    print(f"[render] @{bu} 24/7 cloud bot live (Summarize + Translate enabled)!", flush=True)
     offset = 0
     while True:
         try:
@@ -83,15 +89,34 @@ def bot_loop():
                 continue
             cb = upd.get("callback_query")
             if cb:
-                SESSION.post(api(t, "answerCallbackQuery"), json={"callback_query_id": cb["id"]}, timeout=10)
                 data, cid = cb.get("data", ""), cb["message"]["chat"]["id"]
                 if data.startswith("buy:") and data[4:] in PACKS:
+                    SESSION.post(api(t, "answerCallbackQuery"), json={"callback_query_id": cb["id"]}, timeout=10)
                     p = PACKS[data[4:]]
                     SESSION.post(api(t, "sendInvoice"), json={"chat_id": cid, "title": p["title"], "description": p["description"], "payload": data[4:], "provider_token": "", "currency": "XTR", "prices": [{"label": p["title"], "amount": p["stars"]}]}, timeout=20)
                 elif data.startswith("lang:") and data[5:] in ("uz", "ru", "en", "auto"):
+                    SESSION.post(api(t, "answerCallbackQuery"), json={"callback_query_id": cb["id"]}, timeout=10)
                     conn.execute("UPDATE users SET lang = ? WHERE user_id = ?", (data[5:], cb["from"]["id"]))
                     conn.commit()
                     send_msg(t, cid, f"Language updated to `{data[5:].upper()}`.")
+                elif data.startswith("act:"):
+                    parts = data.split(":")
+                    if len(parts) == 3 and parts[2].isdigit():
+                        act, tid = parts[1], int(parts[2])
+                        SESSION.post(api(t, "answerCallbackQuery"), json={"callback_query_id": cb["id"], "text": "Processing..."}, timeout=10)
+                        rt = conn.execute("SELECT text FROM transcripts WHERE id = ?", (tid,)).fetchone()
+                        if not rt: send_msg(t, cid, "Transcript expired - forward the voice note again.")
+                        else:
+                            SESSION.post(api(t, "sendChatAction"), json={"chat_id": cid, "action": "typing"}, timeout=10)
+                            prompts = {
+                                "sum": ("*Summary:*\n", "Summarize this voice transcript into 3-5 concise bullet points in the same language as the input. Include any action items."),
+                                "en": ("*English Translation:*\n", "Translate accurately into natural English. Output ONLY the translation."),
+                                "ru": ("*Russian Translation:*\n", "Translate accurately into natural Russian. Output ONLY the translation."),
+                                "uz": ("*Uzbek Translation:*\n", "Translate accurately into natural Uzbek Latin (o', g', sh, ch). Output ONLY the translation."),
+                            }
+                            if act in prompts:
+                                hdr, sp = prompts[act]
+                                send_msg(t, cid, f"{hdr}{groq_llm(gk, sp, rt[0]) or 'Could not process.'}")
                 continue
             msg = upd.get("message")
             if not msg: continue
@@ -127,7 +152,7 @@ def bot_loop():
                 continue
             txt = (msg.get("text") or "").strip()
             if txt.startswith("/start"):
-                send_msg(t, cid, f"*Welcome to @{bu}!* (24/7 Cloud)\n\nForward any voice note, audio, or video note (UZ / RU / EN) -> instant accurate transcript!\n- Free: `{FREE_DAILY_LIMIT}/day`\n- `/lang` switch language\n- `/invite` +{REFERRAL_BONUS} free credits/friend\n- `/buy` Telegram Stars packs", buy_kb()); continue
+                send_msg(t, cid, f"*Welcome to @{bu}!* (24/7 Cloud)\n\nForward any voice note, audio, or video note (UZ / RU / EN) -> instant transcript + 1-tap *Summarize* & *Translate (UZ/EN/RU)*!\n- Free: `{FREE_DAILY_LIMIT}/day`\n- `/lang` switch language\n- `/invite` +{REFERRAL_BONUS} free credits/friend\n- `/buy` Telegram Stars packs", buy_kb()); continue
             if txt.startswith("/lang"): send_msg(t, cid, f"Current language: `{ulang.upper()}`", lang_kb()); continue
             if txt.startswith("/buy"): send_msg(t, cid, "*Upgrade with Telegram Stars:*", buy_kb()); continue
             if txt.startswith("/invite"): send_msg(t, cid, f"Share your link (+{REFERRAL_BONUS} credits each):\n`https://t.me/{bu}?start=ref_{uid}`"); continue
@@ -148,8 +173,16 @@ def bot_loop():
                     ab = SESSION.get(f"https://api.telegram.org/file/bot{t}/{fp}", timeout=60).content
                     tr = groq_transcribe(gk, ab, Path(fp).name or "voice.ogg", lang=ulang)
                     if not tr: send_msg(t, cid, "Could not detect speech in that audio.")
-                    elif len(tr) > 3500: SESSION.post(api(t, "sendDocument"), data={"chat_id": cid, "caption": f"Transcript ({len(tr)} chars) - @{bu}"}, files={"document": ("transcript.txt", tr.encode("utf-8"))}, timeout=60)
-                    else: send_msg(t, cid, f"{tr}" + (f"\n\n_Transcribed by @{bu}_" if tier == "free" else ""), share_kb(bu, uid) if tier == "free" else None)
+                    else:
+                        cur = conn.execute("INSERT INTO transcripts (user_id, text, created_at) VALUES (?, ?, ?)", (uid, tr, datetime.now().isoformat(timespec="seconds")))
+                        tid = cur.lastrowid
+                        conn.commit()
+                        kb = transcript_kb(tid, bu, uid, include_share=(tier == "free"))
+                        if len(tr) > 3500:
+                            SESSION.post(api(t, "sendDocument"), data={"chat_id": cid, "caption": f"Transcript ({len(tr)} chars) - @{bu}"}, files={"document": ("transcript.txt", tr.encode("utf-8"))}, timeout=60)
+                            send_msg(t, cid, "Tap below to summarize or translate:", kb)
+                        else:
+                            send_msg(t, cid, f"{tr}" + (f"\n\n_Transcribed by @{bu}_" if tier == "free" else ""), kb)
                 except Exception as e:
                     print(f"[render] err: {e}", flush=True)
                     send_msg(t, cid, "Transcription error - please try again.")
